@@ -8,7 +8,7 @@ import torch.optim as optim
 import argparse
 
 from tqdm import tqdm
-from sae_injection import SAEInjection
+from sae_weightcompress import SAEInjection
 from models import TeacherModel, StudentModel
 from data import get_dataloaders
 

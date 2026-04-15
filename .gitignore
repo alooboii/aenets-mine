@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+*.ipynb
+.ipynb_checkpoints
+**/.ipynb_checkpoints/
+cnn_stitching_pc90_study_lib.py

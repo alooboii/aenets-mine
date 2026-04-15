@@ -87,13 +87,17 @@ def eval_one_epoch(model, dataloader, criterion, device, epoch, total_epochs):
     return avg_loss, accuracy
 
 
+
+
 def main():
     torch.manual_seed(42)
     parser = argparse.ArgumentParser(description="Fine-tune Teacher Model")
     
     # Model and dataset arguments
     parser.add_argument('--model', type=str, default='resnet50', 
-                        help='Model architecture (e.g., resnet50, vgg16)')
+                        help='Model architecture (e.g., resnet18, resnet50, vgg16)')
+    parser.add_argument('--pretrained', action='store_true', default=False,
+                        help='Load ImageNet pretrained weights (default: random init)')
     parser.add_argument('--dataset', type=str, default='CIFAR100', 
                         help='Dataset to use (CIFAR10, CIFAR100, IMAGENETTE, FOOD101, CUSTOM)')
     parser.add_argument('--data-root', type=str, default='./data', 
@@ -139,7 +143,7 @@ def main():
     print(f"{'TEACHER MODEL FINE-TUNING':^80}", flush=True)
     print(f"{'='*80}", flush=True)
     print(f"Device: {device}", flush=True)
-    print(f"Model: {args.model}", flush=True)
+    print(f"Model: {args.model} ({'ImageNet pretrained' if args.pretrained else 'random init'})", flush=True)
     print(f"Dataset: {args.dataset}", flush=True)
     print(f"Batch Size: {args.batch_size} | Epochs: {args.epochs}", flush=True)
     print(f"Learning Rate: {args.lr}", flush=True)
@@ -161,11 +165,12 @@ def main():
     print(f"Dataset loaded: {len(train_loader.dataset)} train samples, "
           f"{len(eval_loader.dataset)} test samples, {num_classes} classes\n", flush=True)
     
-    # Initialize model with pretrained weights
+    # Initialize model (pretrained ImageNet weights only if --pretrained flag is set)
     model = TeacherModel(
         model_name=args.model,
         num_classes=num_classes,
-        weights_path=None  # Will load ImageNet pretrained weights
+        weights_path=None,
+        pretrained=args.pretrained
     ).to(device)
     
     # Count parameters

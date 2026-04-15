@@ -3,9 +3,9 @@ import torch.nn as nn
 import torchvision.models as models
 
 class TeacherModel(nn.Module):
-    def __init__(self, model_name: str, num_classes: int = 100, weights_path: str = None):
+    def __init__(self, model_name: str, num_classes: int = 100, weights_path: str = None, pretrained: bool = False):
         super().__init__()
-        self.model = self._build_model(model_name, pretrained=True, num_classes=num_classes)
+        self.model = self._build_model(model_name, pretrained=pretrained, num_classes=num_classes)
         if weights_path:
             self.load_teacher_weights(weights_path)
 

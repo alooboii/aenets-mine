@@ -1,286 +1,3 @@
-### COMMENTS CONTAIN WEIGHT COMPRESSION SETUP ###
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# from collections import OrderedDict
-# from utils import get_module, get_weight_shape
-# from autoencoders import SparseAutoencoder
-# from weight_compressor import create_weight_compressor
-
-
-# class FeatureHooks:
-#     """
-#     Helper class to extract intermediate features from a network using forward hooks.
-#     """
-#     def __init__(self, named_layers):
-#         self.features = OrderedDict()
-#         self.hooks = []
-        
-#         def hook_fn(name):
-#             def _hook(module, input, output):
-#                 self.features[name] = output
-#             return _hook
-        
-#         for name, layer in named_layers:
-#             self.hooks.append(layer.register_forward_hook(hook_fn(name)))
-    
-#     def clear(self):
-#         """Clears the stored features."""
-#         self.features.clear()
-        
-#     def remove(self):
-#         """Removes all hooks."""
-#         for hook in self.hooks:
-#             hook.remove()
-#         self.hooks.clear()
-
-
-# class SAEInjection(nn.Module):
-#     """
-#     Multi-layer SAE-based feature injection for knowledge distillation with weight compression.
-
-#     For each specified teacher->student layer pair, extracts teacher features,
-#     encodes them to student dimensions via a SparseAutoencoder, and injects
-#     the resulting latent into the corresponding student layer during its forward pass.
-    
-#     Additionally, compresses teacher layer weights to match student layer dimensions
-#     and replaces student weights before the forward pass.
-    
-#     OPTIMIZED: Bypasses early student layers whose outputs would be discarded anyway.
-
-#     Args:
-#         teacher (nn.Module): Pretrained teacher network with attribute `.model`.
-#         student (nn.Module): Student network with attribute `.model`.
-#         teacher_layer_names (list[str]): Names of layers in teacher to hook.
-#         teacher_channels (list[int]): Channel counts for each teacher layer.
-#         student_layer_names (list[str]): Names of student layers to replace.
-#         student_channels (list[int]): Channel counts expected at student layers.
-#         sparsity (float): Sparsity parameter for the SparseAutoencoder.
-#         teacher_weight_layers (list[str], optional): Names of teacher layers whose weights to compress.
-#         student_weight_layers (list[str], optional): Names of student layers to inject compressed weights into.
-#     """
-#     def __init__(
-#         self,
-#         teacher,
-#         student,
-#         teacher_layer_names,
-#         teacher_channels,
-#         student_layer_names,
-#         student_channels,
-#         sparsity,
-#         teacher_weight_layers=None,
-#         student_weight_layers=None,
-#     ):
-#         super(SAEInjection, self).__init__()
-#         assert len(teacher_layer_names) == len(student_layer_names) == \
-#                len(teacher_channels) == len(student_channels), \
-#                "Teacher and student lists must be the same length."
-
-#         self.teacher = teacher
-#         self.student = student
-#         self.sparsity = sparsity
-
-#         # Set up teacher hooks
-#         teacher_named = [
-#             (name, get_module(self.teacher.model, name))
-#             for name in teacher_layer_names
-#         ]
-#         self.teacher_hooks = FeatureHooks(teacher_named)
-
-#         # Create SAE adapters for each layer pair
-#         self.sae_adapters = nn.ModuleList([
-#             SparseAutoencoder(t_ch, s_ch, sparsity)
-#             for t_ch, s_ch in zip(teacher_channels, student_channels)
-#         ])
-
-#         # Get student modules to hook into
-#         self.student_modules = [
-#             get_module(self.student.model, name)
-#             for name in student_layer_names
-#         ]
-
-#         # Save layer names for bookkeeping
-#         self.teacher_layer_names = teacher_layer_names
-#         self.student_layer_names = student_layer_names
-        
-#         # Find the earliest injection layer and bypass everything before it
-#         self.earliest_injection_layer = self._find_earliest_layer(student_layer_names)
-        
-#         # ===== WEIGHT COMPRESSION SETUP =====
-#         self.teacher_weight_layers = teacher_weight_layers
-#         self.student_weight_layers = student_weight_layers
-#         self.weight_compressors = nn.ModuleList()
-#         self.teacher_weight_modules = []
-#         self.student_weight_modules = []
-        
-#         if teacher_weight_layers is not None and student_weight_layers is not None:
-#             assert len(teacher_weight_layers) == len(student_weight_layers), \
-#                    "Teacher and student weight layer lists must be the same length."
-            
-#             print(f"\n{'='*60}")
-#             print("Weight Compression Setup")
-#             print(f"{'='*60}")
-            
-#             for t_weight_layer, s_weight_layer in zip(teacher_weight_layers, student_weight_layers):
-#                 # Get the actual modules
-#                 t_module = get_module(self.teacher.model, t_weight_layer)
-#                 s_module = get_module(self.student.model, s_weight_layer)
-                
-#                 self.teacher_weight_modules.append(t_module)
-#                 self.student_weight_modules.append(s_module)
-                
-#                 # Get weight shapes
-#                 t_shape = get_weight_shape(self.teacher.model, t_weight_layer)
-#                 s_shape = get_weight_shape(self.student.model, s_weight_layer)
-                
-#                 # Create weight compressor
-#                 compressor = create_weight_compressor(t_shape, s_shape, compressor_type='auto')
-#                 self.weight_compressors.append(compressor)
-                
-#                 print(f"Teacher Layer: {t_weight_layer} | Shape: {t_shape}")
-#                 print(f"Student Layer: {s_weight_layer} | Shape: {s_shape}")
-#                 print(f"Compressor Type: {type(compressor).__name__}")
-#                 print(f"{'-'*60}")
-        
-#         print(f"\n{'='*60}")
-#         print("SAEInjection: Optimized Architecture")
-#         print(f"{'='*60}")
-#         print(f"Injection layers: {student_layer_names}")
-#         print(f"Earliest injection: {self.earliest_injection_layer}")
-#         print(f"\nOptimization: Bypassing student layers before {self.earliest_injection_layer}")
-#         print(f"{'='*60}\n")
-
-#     def _find_earliest_layer(self, layer_names):
-#         """
-#         Find the earliest layer among injection points.
-#         For ResNet-style: layer1 < layer2 < layer3 < layer4
-#         """
-#         layer_order = ['layer1', 'layer2', 'layer3', 'layer4']
-#         earliest_idx = float('inf')
-#         earliest_name = None
-        
-#         for name in layer_names:
-#             layer_prefix = name.split('[')[0]  # Handle 'layer2[0]' -> 'layer2'
-#             if layer_prefix in layer_order:
-#                 idx = layer_order.index(layer_prefix)
-#                 if idx < earliest_idx:
-#                     earliest_idx = idx
-#                     earliest_name = layer_prefix
-        
-#         return earliest_name if earliest_name else layer_names[0]
-
-#     def _compress_and_inject_weights(self):
-#         """
-#         Compress teacher weights and inject them into student layers.
-#         This is called before each forward pass.
-#         """
-#         if not self.teacher_weight_modules:
-#             return
-        
-#         with torch.no_grad():
-#             for t_module, s_module, compressor in zip(
-#                 self.teacher_weight_modules, 
-#                 self.student_weight_modules, 
-#                 self.weight_compressors
-#             ):
-#                 # Get teacher weights
-#                 teacher_weights = t_module.weight.data
-                
-#                 # Compress weights
-#                 compressed_weights, _ = compressor(teacher_weights)
-                
-#                 # Inject compressed weights into student module
-#                 s_module.weight.data.copy_(compressed_weights)
-
-#     def _forward_student_from_injection(self, latents_dict):
-#         """
-#         Forward through student starting from the earliest injection layer.
-        
-#         Args:
-#             latents_dict: Dictionary mapping layer names to SAE latents to inject
-#         """
-#         model = self.student.model
-        
-#         # Start with the first latent (assumes single injection point for simplicity)
-#         # For multi-layer injection, you'd need more sophisticated logic
-#         x = list(latents_dict.values())[0]
-        
-#         # Map of layer progression for ResNet-style architectures
-#         layer_order = ['layer1', 'layer2', 'layer3', 'layer4']
-        
-#         # Find current layer position and continue from next layer
-#         earliest_layer = self.earliest_injection_layer
-#         try:
-#             if earliest_layer in layer_order:
-#                 current_idx = layer_order.index(earliest_layer)
-#                 # Continue from next layer
-#                 for next_layer_name in layer_order[current_idx + 1:]:
-#                     if hasattr(model, next_layer_name):
-#                         # Check if this layer needs injection
-#                         if next_layer_name in [name.split('[')[0] for name in self.student_layer_names]:
-#                             # Replace with injected latent if available
-#                             for layer_name, latent in latents_dict.items():
-#                                 if layer_name.startswith(next_layer_name):
-#                                     x = latent
-#                                     break
-#                         else:
-#                             # Normal forward pass
-#                             x = getattr(model, next_layer_name)(x)
-#         except Exception as e:
-#             print(f"Warning: Could not parse layer structure: {e}")
-#             # Fallback: try to use all remaining major layers
-#             for layer_name in layer_order:
-#                 if hasattr(model, layer_name):
-#                     try:
-#                         x = getattr(model, layer_name)(x)
-#                     except:
-#                         pass
-        
-#         # Final pooling and classifier
-#         if hasattr(model, 'avgpool'):
-#             x = model.avgpool(x)
-#         elif hasattr(model, 'global_pool'):
-#             x = model.global_pool(x)
-        
-#         x = torch.flatten(x, 1)
-        
-#         if hasattr(model, 'fc'):
-#             x = model.fc(x)
-#         elif hasattr(model, 'classifier'):
-#             x = model.classifier(x)
-        
-#         return x
-
-#     def forward(self, x):
-#         # ===== WEIGHT COMPRESSION: Inject compressed weights BEFORE forward pass =====
-#         self._compress_and_inject_weights()
-        
-#         # Run teacher and collect features
-#         teacher_logits = self.teacher(x)
-#         # Capture all teacher features
-#         features = [self.teacher_hooks.features.get(name) for name in self.teacher_layer_names]
-#         # Clear for next forward
-#         self.teacher_hooks.clear()
-
-#         # Compute latents and SAE losses
-#         latents = []
-#         total_sae_loss = 0.0
-#         for feat, adapter in zip(features, self.sae_adapters):
-#             if feat is None:
-#                 raise ValueError("Missing teacher feature. Ensure correct layer names.")
-#             recon, latent, sae_loss = adapter(feat)
-#             latents.append(latent)
-#             # SAE loss could be a tensor
-#             total_sae_loss = total_sae_loss + sae_loss if sae_loss is not None else total_sae_loss
-
-#         # Create dictionary of layer names to latents
-#         latents_dict = {name: lat for name, lat in zip(self.student_layer_names, latents)}
-        
-#         # Forward through student from injection point onwards
-#         student_logits = self._forward_student_from_injection(latents_dict)
-
-#         return teacher_logits, student_logits, total_sae_loss
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -484,132 +201,260 @@ class SAEInjection(nn.Module):
     def _build_teacher_trunk(self, teacher_model, hint_layer_name):
         """
         Extracts teacher layers up to and including the hint layer.
+        Supports both ResNet and VGG architectures.
         
         Args:
             teacher_model: Teacher's .model attribute
-            hint_layer_name: Name of hint layer (e.g., 'layer3', 'layer2[1]')
+            hint_layer_name: Name of hint layer (e.g., 'layer3', 'features[10]')
             
         Returns:
             nn.Sequential containing the teacher trunk
         """
         layers = []
         
-        # Handle initial layers (conv1, bn1, relu, maxpool for ResNet-style)
-        initial_layer_names = ['conv1', 'bn1', 'relu', 'maxpool']
-        for name in initial_layer_names:
-            if hasattr(teacher_model, name):
-                layers.append((name, getattr(teacher_model, name)))
+        # Detect architecture type
+        is_vgg = hasattr(teacher_model, 'features') and hasattr(teacher_model, 'classifier')
+        is_resnet = hasattr(teacher_model, 'layer1')
         
-        # Parse hint layer name to determine which blocks to include
-        hint_base = hint_layer_name.split('[')[0]  # 'layer3[0]' -> 'layer3'
-        hint_idx = None
-        if '[' in hint_layer_name:
-            hint_idx = int(hint_layer_name.split('[')[1].rstrip(']'))
-        
-        # Add layer blocks up to and including hint layer
-        layer_order = ['layer1', 'layer2', 'layer3', 'layer4']
-        for layer_name in layer_order:
-            if hasattr(teacher_model, layer_name):
-                layer_block = getattr(teacher_model, layer_name)
-                
-                if layer_name == hint_base:
-                    # Include up to hint_idx if specified
-                    if hint_idx is not None and isinstance(layer_block, nn.Sequential):
-                        for i in range(hint_idx + 1):
-                            layers.append((f"{layer_name}[{i}]", layer_block[i]))
+        if is_resnet:
+            # ResNet architecture handling
+            initial_layer_names = ['conv1', 'bn1', 'relu', 'maxpool']
+            for name in initial_layer_names:
+                if hasattr(teacher_model, name):
+                    layers.append((name, getattr(teacher_model, name)))
+            
+            # Parse hint layer name
+            hint_base = hint_layer_name.split('[')[0]
+            hint_idx = None
+            if '[' in hint_layer_name:
+                hint_idx = int(hint_layer_name.split('[')[1].rstrip(']'))
+            
+            # Add layer blocks up to and including hint layer
+            layer_order = ['layer1', 'layer2', 'layer3', 'layer4']
+            for layer_name in layer_order:
+                if hasattr(teacher_model, layer_name):
+                    layer_block = getattr(teacher_model, layer_name)
+                    
+                    if layer_name == hint_base:
+                        if hint_idx is not None and isinstance(layer_block, nn.Sequential):
+                            for i in range(hint_idx + 1):
+                                layers.append((f"{layer_name}[{i}]", layer_block[i]))
+                        else:
+                            layers.append((layer_name, layer_block))
+                        break
                     else:
                         layers.append((layer_name, layer_block))
-                    break  # Stop after hint layer
+                        
+                    if layer_order.index(layer_name) >= layer_order.index(hint_base):
+                        break
+        
+        elif is_vgg:
+            # VGG architecture handling
+            # Parse hint layer name (e.g., 'features[10]' or 'features')
+            if hint_layer_name.startswith('features'):
+                features_block = teacher_model.features
+                
+                if '[' in hint_layer_name:
+                    # Specific index in features
+                    hint_idx = int(hint_layer_name.split('[')[1].rstrip(']'))
+                    for i in range(hint_idx + 1):
+                        layers.append((f"features[{i}]", features_block[i]))
                 else:
-                    layers.append((layer_name, layer_block))
-                    
-                # Check if we've passed the hint layer
-                if layer_order.index(layer_name) >= layer_order.index(hint_base):
-                    break
+                    # All features
+                    layers.append(('features', features_block))
+            
+            elif hint_layer_name.startswith('classifier'):
+                # Include all features + avgpool + flatten + part of classifier
+                layers.append(('features', teacher_model.features))
+                layers.append(('avgpool', teacher_model.avgpool))
+                layers.append(('flatten', nn.Flatten(1)))
+                
+                classifier_block = teacher_model.classifier
+                if '[' in hint_layer_name:
+                    hint_idx = int(hint_layer_name.split('[')[1].rstrip(']'))
+                    for i in range(hint_idx + 1):
+                        layers.append((f"classifier[{i}]", classifier_block[i]))
+                else:
+                    layers.append(('classifier', classifier_block))
+            else:
+                raise ValueError(f"Invalid VGG hint layer name: {hint_layer_name}")
+        
+        else:
+            raise ValueError(f"Unsupported architecture (not ResNet or VGG)")
         
         return nn.Sequential(OrderedDict(layers))
     
     def _build_student_trunk(self, student_model, layer_names_to_include):
         """
         Extracts ONLY the specified student layers.
+        Supports both ResNet and VGG architectures.
         """
         layers = []
         
-        # Define all possible layer names in order
-        all_layer_names = ['layer1', 'layer2', 'layer3', 'layer4', 'avgpool', 'global_pool', 'flatten', 'fc', 'classifier']
+        # Detect architecture
+        is_vgg = hasattr(student_model, 'features') and hasattr(student_model, 'classifier')
+        is_resnet = hasattr(student_model, 'layer1')
         
-        # Track the last layer to determine output channels
-        last_conv_layer = None
+        if is_resnet:
+            # ResNet handling (existing code)
+            all_layer_names = ['layer1', 'layer2', 'layer3', 'layer4', 'avgpool', 'global_pool', 'flatten', 'fc', 'classifier']
+            last_conv_layer = None
+            
+            for layer_name in all_layer_names:
+                if layer_name in layer_names_to_include:
+                    if hasattr(student_model, layer_name):
+                        layer = getattr(student_model, layer_name)
+                        if layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
+                            last_conv_layer = layer_name
+                        layers.append((layer_name, layer))
+                    elif layer_name == 'flatten':
+                        layers.append(('flatten', nn.Flatten(1)))
+                    else:
+                        print(f"Warning: Requested layer '{layer_name}' not found in student model")
+            
+            # Auto-add pooling and flatten if fc/classifier is requested
+            if 'flatten' in layer_names_to_include:
+                has_pooling = any(name in ['avgpool', 'global_pool'] for name, _ in layers)
+                if not has_pooling:
+                    if hasattr(student_model, 'avgpool'):
+                        flatten_idx = next(i for i, (name, _) in enumerate(layers) if name == 'flatten')
+                        layers.insert(flatten_idx, ('avgpool', student_model.avgpool))
+                    elif hasattr(student_model, 'global_pool'):
+                        flatten_idx = next(i for i, (name, _) in enumerate(layers) if name == 'flatten')
+                        layers.insert(flatten_idx, ('global_pool', student_model.global_pool))
+            
+            if ('fc' in layer_names_to_include or 'classifier' in layer_names_to_include):
+                has_flatten = any(name == 'flatten' for name, _ in layers)
+                if not has_flatten:
+                    fc_idx = next((i for i, (name, _) in enumerate(layers) if name in ['fc', 'classifier']), None)
+                    if fc_idx is not None:
+                        has_pooling = any(name in ['avgpool', 'global_pool'] for name, _ in layers)
+                        if not has_pooling:
+                            if hasattr(student_model, 'avgpool'):
+                                layers.insert(fc_idx, ('avgpool', student_model.avgpool))
+                                fc_idx += 1
+                            elif hasattr(student_model, 'global_pool'):
+                                layers.insert(fc_idx, ('global_pool', student_model.global_pool))
+                                fc_idx += 1
+                        layers.insert(fc_idx, ('flatten', nn.Flatten(1)))
+            
+            # Fix FC layer dimension mismatch
+            if ('fc' in layer_names_to_include or 'classifier' in layer_names_to_include):
+                channel_map_resnet18 = {'layer1': 64, 'layer2': 128, 'layer3': 256, 'layer4': 512}
+                
+                if last_conv_layer and last_conv_layer in channel_map_resnet18:
+                    expected_features = channel_map_resnet18[last_conv_layer]
+                    
+                    if hasattr(student_model, 'fc'):
+                        original_fc = student_model.fc
+                        num_classes = original_fc.out_features
+                        
+                        if original_fc.in_features != expected_features:
+                            print(f"WARNING: FC layer mismatch detected!")
+                            print(f"  Expected input features: {expected_features} (from {last_conv_layer})")
+                            print(f"  Original FC input features: {original_fc.in_features}")
+                            print(f"  Creating new FC layer: {expected_features} -> {num_classes}")
+                            
+                            fc_idx = next((i for i, (name, _) in enumerate(layers) if name == 'fc'), None)
+                            if fc_idx is not None:
+                                new_fc = nn.Linear(expected_features, num_classes)
+                                layers[fc_idx] = ('fc', new_fc)
         
-        for layer_name in all_layer_names:
-            # Check if this layer should be included
-            if layer_name in layer_names_to_include:
-                # Handle standard layers
-                if hasattr(student_model, layer_name):
-                    layer = getattr(student_model, layer_name)
-                    
-                    # Track last convolutional layer for dimension calculation
-                    if layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
-                        last_conv_layer = layer_name
-                    
-                    layers.append((layer_name, layer))
-                # Handle special case for flatten
+        elif is_vgg:
+            # VGG handling
+            for layer_name in layer_names_to_include:
+                if layer_name.startswith('features'):
+                    features_block = student_model.features
+                    if '[' in layer_name:
+                        # Specific index range (e.g., 'features[10:]')
+                        if ':' in layer_name:
+                            start_idx = int(layer_name.split('[')[1].split(':')[0])
+                            end_part = layer_name.split(':')[1].rstrip(']')
+                            end_idx = int(end_part) if end_part else len(features_block)
+                            for i in range(start_idx, end_idx):
+                                layers.append((f"features[{i}]", features_block[i]))
+                        else:
+                            # Single index
+                            idx = int(layer_name.split('[')[1].rstrip(']'))
+                            layers.append((layer_name, features_block[idx]))
+                    else:
+                        # All features
+                        layers.append(('features', features_block))
+                
+                elif layer_name == 'avgpool':
+                    layers.append(('avgpool', student_model.avgpool))
+                
                 elif layer_name == 'flatten':
                     layers.append(('flatten', nn.Flatten(1)))
-                else:
-                    print(f"Warning: Requested layer '{layer_name}' not found in student model")
-        
-        # Auto-add pooling and flatten if fc/classifier is requested
-        if 'flatten' in layer_names_to_include:
-            has_pooling = any(name in ['avgpool', 'global_pool'] for name, _ in layers)
-            if not has_pooling:
-                if hasattr(student_model, 'avgpool'):
-                    flatten_idx = next(i for i, (name, _) in enumerate(layers) if name == 'flatten')
-                    layers.insert(flatten_idx, ('avgpool', student_model.avgpool))
-                elif hasattr(student_model, 'global_pool'):
-                    flatten_idx = next(i for i, (name, _) in enumerate(layers) if name == 'flatten')
-                    layers.insert(flatten_idx, ('global_pool', student_model.global_pool))
-        
-        if ('fc' in layer_names_to_include or 'classifier' in layer_names_to_include):
-            has_flatten = any(name == 'flatten' for name, _ in layers)
-            if not has_flatten:
-                fc_idx = next((i for i, (name, _) in enumerate(layers) if name in ['fc', 'classifier']), None)
-                if fc_idx is not None:
-                    has_pooling = any(name in ['avgpool', 'global_pool'] for name, _ in layers)
-                    if not has_pooling:
-                        if hasattr(student_model, 'avgpool'):
-                            layers.insert(fc_idx, ('avgpool', student_model.avgpool))
-                            fc_idx += 1
-                        elif hasattr(student_model, 'global_pool'):
-                            layers.insert(fc_idx, ('global_pool', student_model.global_pool))
-                            fc_idx += 1
-                    layers.insert(fc_idx, ('flatten', nn.Flatten(1)))
-        
-        # **NEW: Fix FC layer dimension mismatch**
-        if ('fc' in layer_names_to_include or 'classifier' in layer_names_to_include):
-            # Determine expected input features based on last conv layer
-            channel_map_resnet18 = {'layer1': 64, 'layer2': 128, 'layer3': 256, 'layer4': 512}
-            
-            if last_conv_layer and last_conv_layer in channel_map_resnet18:
-                expected_features = channel_map_resnet18[last_conv_layer]
                 
-                # Get the original FC layer
-                if hasattr(student_model, 'fc'):
-                    original_fc = student_model.fc
-                    num_classes = original_fc.out_features
-                    
-                    # If dimensions don't match, create a new FC layer
-                    if original_fc.in_features != expected_features:
-                        print(f"WARNING: FC layer mismatch detected!")
-                        print(f"  Expected input features: {expected_features} (from {last_conv_layer})")
-                        print(f"  Original FC input features: {original_fc.in_features}")
-                        print(f"  Creating new FC layer: {expected_features} -> {num_classes}")
+                elif layer_name.startswith('classifier'):
+                    classifier_block = student_model.classifier
+                    if '[' in layer_name:
+                        if ':' in layer_name:
+                            start_idx = int(layer_name.split('[')[1].split(':')[0])
+                            end_part = layer_name.split(':')[1].rstrip(']')
+                            end_idx = int(end_part) if end_part else len(classifier_block)
+                            for i in range(start_idx, end_idx):
+                                layers.append((f"classifier[{i}]", classifier_block[i]))
+                        else:
+                            idx = int(layer_name.split('[')[1].rstrip(']'))
+                            layers.append((layer_name, classifier_block[idx]))
+                    else:
+                        layers.append(('classifier', classifier_block))
+            
+            # Auto-add necessary layers for VGG
+            has_avgpool = any('avgpool' in name for name, _ in layers)
+            has_flatten = any('flatten' in name for name, _ in layers)
+            has_classifier = any('classifier' in name for name, _ in layers)
+            
+            if has_classifier and not has_flatten:
+                classifier_idx = next(i for i, (name, _) in enumerate(layers) if 'classifier' in name)
+                if not has_avgpool:
+                    layers.insert(classifier_idx, ('avgpool', student_model.avgpool))
+                    classifier_idx += 1
+                layers.insert(classifier_idx, ('flatten', nn.Flatten(1)))
+            
+            # Fix classifier dimension mismatch for VGG
+            if has_classifier:
+                # Determine expected features based on VGG architecture
+                vgg_feature_map = {
+                    'vgg11': 512, 'vgg13': 512, 'vgg16': 512, 'vgg19': 512,
+                    'vgg11_bn': 512, 'vgg13_bn': 512, 'vgg16_bn': 512, 'vgg19_bn': 512
+                }
+                
+                # Check if we can find the architecture name
+                model_name = student_model.__class__.__name__.lower()
+                expected_features = 512 * 7 * 7  # Default VGG flattened size
+                
+                # Find first Linear layer in classifier
+                classifier_block = student_model.classifier
+                for i, layer in enumerate(classifier_block):
+                    if isinstance(layer, nn.Linear):
+                        original_in_features = layer.in_features
+                        num_classes = classifier_block[-1].out_features if isinstance(classifier_block[-1], nn.Linear) else layer.out_features
                         
-                        # Replace the FC layer in the layers list
-                        fc_idx = next((i for i, (name, _) in enumerate(layers) if name == 'fc'), None)
-                        if fc_idx is not None:
-                            new_fc = nn.Linear(expected_features, num_classes)
-                            layers[fc_idx] = ('fc', new_fc)
+                        if original_in_features != expected_features:
+                            print(f"WARNING: VGG classifier mismatch detected!")
+                            print(f"  Expected input features: {expected_features}")
+                            print(f"  Original classifier input features: {original_in_features}")
+                            print(f"  Rebuilding classifier with correct dimensions")
+                            
+                            # Rebuild classifier with correct input size
+                            new_classifier_layers = []
+                            for j, orig_layer in enumerate(classifier_block):
+                                if j == 0 and isinstance(orig_layer, nn.Linear):
+                                    new_classifier_layers.append(nn.Linear(expected_features, orig_layer.out_features))
+                                else:
+                                    new_classifier_layers.append(orig_layer)
+                            
+                            # Replace in layers list
+                            classifier_idx = next((idx for idx, (name, _) in enumerate(layers) if 'classifier' in name), None)
+                            if classifier_idx is not None:
+                                layers[classifier_idx] = ('classifier', nn.Sequential(*new_classifier_layers))
+                        break
+        
+        else:
+            raise ValueError("Unsupported architecture (not ResNet or VGG)")
         
         print_layers = [name for name, _ in layers]
         print(f"Student trunk layers (ONLY specified): {print_layers}")
