@@ -51,6 +51,9 @@ def parse_args():
 
     p.add_argument("--recover-epochs", type=int, default=20)
     p.add_argument("--recover-lr", type=float, default=1e-3)
+    p.add_argument("--recover-mse-weight", type=float, default=1.0)
+    p.add_argument("--recover-kd-weight", type=float, default=0.0)
+    p.add_argument("--temperature", type=float, default=4.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--track-assembled-val-acc", action="store_true", default=False)
 
@@ -99,15 +102,22 @@ def train_prefix_epoch(
     recovered_prefix: nn.Module,
     teacher_prefix: nn.Module,
     sae_encoder: nn.Module,
+    trained_tail: nn.Module,
+    teacher_model: nn.Module,
     optimizer: optim.Optimizer,
     dataloader,
     device: torch.device,
-) -> float:
+    mse_weight: float,
+    kd_weight: float,
+    temperature: float,
+) -> Dict[str, float]:
     recovered_prefix.train()
     teacher_prefix.eval()
     sae_encoder.eval()
 
     total_loss = 0.0
+    total_mse = 0.0
+    total_kd = 0.0
     total_samples = 0
 
     for data, _ in dataloader:
@@ -116,17 +126,37 @@ def train_prefix_epoch(
 
         with torch.no_grad():
             target = sae_encoder(teacher_prefix(data))
+            teacher_logits = teacher_model(data) if kd_weight > 0.0 else None
 
         pred = recovered_prefix(data)
-        loss = F.mse_loss(pred, target)
+        mse_loss = F.mse_loss(pred, target)
+
+        if kd_weight > 0.0:
+            student_logits = trained_tail(pred)
+            kd_loss = F.kl_div(
+                F.log_softmax(student_logits / temperature, dim=1),
+                F.softmax(teacher_logits / temperature, dim=1),
+                reduction="batchmean",
+            ) * (temperature ** 2)
+        else:
+            kd_loss = torch.tensor(0.0, device=device)
+
+        loss = mse_weight * mse_loss + kd_weight * kd_loss
         loss.backward()
         optimizer.step()
 
         bs = data.size(0)
         total_loss += loss.item() * bs
+        total_mse += mse_loss.item() * bs
+        total_kd += kd_loss.item() * bs
         total_samples += bs
 
-    return total_loss / max(total_samples, 1)
+    n = max(total_samples, 1)
+    return {
+        "total": total_loss / n,
+        "mse": total_mse / n,
+        "kd": total_kd / n,
+    }
 
 
 @torch.no_grad()
@@ -134,31 +164,62 @@ def eval_prefix_epoch(
     recovered_prefix: nn.Module,
     teacher_prefix: nn.Module,
     sae_encoder: nn.Module,
+    trained_tail: nn.Module,
+    teacher_model: nn.Module,
     dataloader,
     device: torch.device,
-) -> float:
+    mse_weight: float,
+    kd_weight: float,
+    temperature: float,
+) -> Dict[str, float]:
     recovered_prefix.eval()
     teacher_prefix.eval()
     sae_encoder.eval()
 
     total_loss = 0.0
+    total_mse = 0.0
+    total_kd = 0.0
     total_samples = 0
 
     for data, _ in dataloader:
         data = data.to(device)
         target = sae_encoder(teacher_prefix(data))
         pred = recovered_prefix(data)
-        loss = F.mse_loss(pred, target)
+        mse_loss = F.mse_loss(pred, target)
+        if kd_weight > 0.0:
+            teacher_logits = teacher_model(data)
+            student_logits = trained_tail(pred)
+            kd_loss = F.kl_div(
+                F.log_softmax(student_logits / temperature, dim=1),
+                F.softmax(teacher_logits / temperature, dim=1),
+                reduction="batchmean",
+            ) * (temperature ** 2)
+        else:
+            kd_loss = torch.tensor(0.0, device=device)
+
+        loss = mse_weight * mse_loss + kd_weight * kd_loss
 
         bs = data.size(0)
         total_loss += loss.item() * bs
+        total_mse += mse_loss.item() * bs
+        total_kd += kd_loss.item() * bs
         total_samples += bs
 
-    return total_loss / max(total_samples, 1)
+    n = max(total_samples, 1)
+    return {
+        "total": total_loss / n,
+        "mse": total_mse / n,
+        "kd": total_kd / n,
+    }
 
 
 def main():
     args = parse_args()
+    if args.recover_mse_weight < 0.0 or args.recover_kd_weight < 0.0:
+        raise ValueError("--recover-mse-weight and --recover-kd-weight must be non-negative.")
+    if args.recover_mse_weight == 0.0 and args.recover_kd_weight == 0.0:
+        raise ValueError("At least one of --recover-mse-weight or --recover-kd-weight must be > 0.")
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -195,6 +256,10 @@ def main():
 
     checkpoint = _safe_torch_load(args.aenets_checkpoint, device)
     kd_model.load_state_dict(checkpoint, strict=True)
+    if args.teacher_weights:
+        # Ensure logit-KD uses the explicitly requested teacher checkpoint,
+        # even when the hybrid checkpoint also contains teacher parameters.
+        kd_model.teacher.load_teacher_weights(args.teacher_weights)
 
     site_check = validate_recovery_site(
         teacher_model=kd_model.teacher.model,
@@ -225,6 +290,7 @@ def main():
     )
     recovered_prefix = copy.deepcopy(discarded_prefix_template).to(device)
 
+    freeze_module(kd_model.teacher)
     freeze_module(teacher_prefix)
     freeze_module(sae_encoder)
     freeze_module(trained_tail)
@@ -259,9 +325,13 @@ def main():
         writer.writerow(
             [
                 "epoch",
+                "train_total_loss",
                 "train_mse",
+                "train_kd",
+                "val_total_loss",
                 "val_mse",
-                "best_val_mse",
+                "val_kd",
+                "best_val_total",
                 "assembled_val_acc",
                 "epoch_time_s",
             ]
@@ -269,20 +339,30 @@ def main():
 
         for epoch in range(1, args.recover_epochs + 1):
             t0 = time.perf_counter()
-            train_mse = train_prefix_epoch(
+            train_metrics = train_prefix_epoch(
                 recovered_prefix=recovered_prefix,
                 teacher_prefix=teacher_prefix,
                 sae_encoder=sae_encoder,
+                trained_tail=trained_tail,
+                teacher_model=kd_model.teacher,
                 optimizer=optimizer,
                 dataloader=train_loader,
                 device=device,
+                mse_weight=args.recover_mse_weight,
+                kd_weight=args.recover_kd_weight,
+                temperature=args.temperature,
             )
-            val_mse = eval_prefix_epoch(
+            val_metrics = eval_prefix_epoch(
                 recovered_prefix=recovered_prefix,
                 teacher_prefix=teacher_prefix,
                 sae_encoder=sae_encoder,
+                trained_tail=trained_tail,
+                teacher_model=kd_model.teacher,
                 dataloader=eval_loader,
                 device=device,
+                mse_weight=args.recover_mse_weight,
+                kd_weight=args.recover_kd_weight,
+                temperature=args.temperature,
             )
 
             assembled_val_acc = ""
@@ -295,8 +375,8 @@ def main():
                 )
                 assembled_val_acc = eval_student_accuracy(temp_student, eval_loader, device)
 
-            if val_mse < best_val:
-                best_val = val_mse
+            if val_metrics["total"] < best_val:
+                best_val = val_metrics["total"]
                 best_epoch = epoch
                 best_state = {
                     k: v.detach().cpu().clone()
@@ -308,8 +388,12 @@ def main():
             writer.writerow(
                 [
                     epoch,
-                    train_mse,
-                    val_mse,
+                    train_metrics["total"],
+                    train_metrics["mse"],
+                    train_metrics["kd"],
+                    val_metrics["total"],
+                    val_metrics["mse"],
+                    val_metrics["kd"],
                     best_val,
                     assembled_val_acc,
                     elapsed,
@@ -319,8 +403,13 @@ def main():
 
             print(
                 f"Epoch {epoch}/{args.recover_epochs} | "
-                f"train_mse={train_mse:.6f} | val_mse={val_mse:.6f} | "
-                f"best_val_mse={best_val:.6f}"
+                f"train_total={train_metrics['total']:.6f} | "
+                f"train_mse={train_metrics['mse']:.6f} | "
+                f"train_kd={train_metrics['kd']:.6f} | "
+                f"val_total={val_metrics['total']:.6f} | "
+                f"val_mse={val_metrics['mse']:.6f} | "
+                f"val_kd={val_metrics['kd']:.6f} | "
+                f"best_val_total={best_val:.6f}"
             )
 
     if best_state is None:
@@ -348,7 +437,10 @@ def main():
         "student_layers": args.student_layers,
         "boundary_stage": boundary_stage,
         "best_epoch": best_epoch,
-        "best_val_mse": best_val,
+        "best_val_total": best_val,
+        "recover_mse_weight": args.recover_mse_weight,
+        "recover_kd_weight": args.recover_kd_weight,
+        "temperature": args.temperature,
         "hybrid_val_acc": hybrid_val_acc,
         "pure_student_val_acc": pure_student_val_acc,
         "site_check": {
@@ -374,7 +466,7 @@ def main():
 
     print("\nRecovery complete.")
     print(f"  Best epoch             : {best_epoch}")
-    print(f"  Best val MSE           : {best_val:.6f}")
+    print(f"  Best val total         : {best_val:.6f}")
     print(f"  Hybrid val accuracy    : {hybrid_val_acc*100:.2f}%")
     print(f"  Pure student val acc   : {pure_student_val_acc*100:.2f}%")
     print(f"  CSV log                : {csv_path}")
