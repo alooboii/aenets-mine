@@ -12,3 +12,4 @@ wheels/
 .ipynb_checkpoints
 **/.ipynb_checkpoints/
 cnn_stitching_pc90_study_lib.py
+logs/

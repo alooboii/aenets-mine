@@ -483,8 +483,11 @@ def compute_loss(method, teacher_logits, student_logits, target,
         return total, cls_loss_val, kl_loss.item(), aux.item()
 
     else:
-        # logit_kd, crd — aux_loss is the method's primary distillation loss
-        kd_loss = aux if aux is not None and torch.is_tensor(aux) and aux.numel() > 0 else kl_loss
+        # logit_kd uses KL directly; CRD uses its own auxiliary criterion.
+        if method == 'logit_kd' or aux_loss is None:
+            kd_loss = kl_loss
+        else:
+            kd_loss = aux
         total = args.cls_weight * cls_loss + args.kd_weight * kd_loss
         return total, cls_loss_val, kd_loss.item(), 0.0
 
