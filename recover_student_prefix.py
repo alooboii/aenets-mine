@@ -326,6 +326,7 @@ def main():
     best_val = float("inf")
     best_epoch = 0
     best_state: Optional[Dict[str, torch.Tensor]] = None
+    best_recovered_val_acc: Optional[float] = None
 
     csv_path = os.path.join(args.save_dir, f"{args.experiment_name}.csv")
     prefix_best_path = os.path.join(
@@ -352,6 +353,7 @@ def main():
                 "val_kd",
                 "best_val_total",
                 "assembled_val_acc",
+                "pure_recovered_student_val_acc",
                 "epoch_time_s",
             ]
         )
@@ -384,7 +386,7 @@ def main():
                 temperature=args.temperature,
             )
 
-            assembled_val_acc = ""
+            assembled_val_acc: Optional[float] = None
             if args.track_assembled_val_acc:
                 temp_student = copy.deepcopy(kd_model.student).to(device)
                 copy_prefix_weights(
@@ -393,6 +395,8 @@ def main():
                     boundary_stage=boundary_stage,
                 )
                 assembled_val_acc = eval_student_accuracy(temp_student, eval_loader, device)
+                if best_recovered_val_acc is None or assembled_val_acc > best_recovered_val_acc:
+                    best_recovered_val_acc = assembled_val_acc
 
             if val_metrics["total"] < best_val:
                 best_val = val_metrics["total"]
@@ -414,13 +418,14 @@ def main():
                     val_metrics["mse"],
                     val_metrics["kd"],
                     best_val,
-                    assembled_val_acc,
+                    assembled_val_acc if assembled_val_acc is not None else "",
+                    assembled_val_acc if assembled_val_acc is not None else "",
                     elapsed,
                 ]
             )
             f.flush()
 
-            print(
+            msg = (
                 f"Epoch {epoch}/{args.recover_epochs} | "
                 f"train_total={train_metrics['total']:.6f} | "
                 f"train_mse={train_metrics['mse']:.6f} | "
@@ -430,6 +435,9 @@ def main():
                 f"val_kd={val_metrics['kd']:.6f} | "
                 f"best_val_total={best_val:.6f}"
             )
+            if assembled_val_acc is not None:
+                msg += f" | pure_recovered_val_acc={assembled_val_acc*100:.2f}%"
+            print(msg)
 
     if best_state is None:
         raise RuntimeError("Recovery training did not produce a best checkpoint.")
@@ -463,6 +471,7 @@ def main():
         "recover_init_method": args.recover_init_method,
         "hybrid_val_acc": hybrid_val_acc,
         "pure_student_val_acc": pure_student_val_acc,
+        "best_recovered_student_val_acc": best_recovered_val_acc,
         "site_check": {
             "reason": site_check.reason,
             "recoverable": site_check.recoverable,
@@ -489,6 +498,8 @@ def main():
     print(f"  Best val total         : {best_val:.6f}")
     print(f"  Hybrid val accuracy    : {hybrid_val_acc*100:.2f}%")
     print(f"  Pure student val acc   : {pure_student_val_acc*100:.2f}%")
+    if best_recovered_val_acc is not None:
+        print(f"  Best recovered val acc : {best_recovered_val_acc*100:.2f}%")
     print(f"  CSV log                : {csv_path}")
     print(f"  Recovered prefix (best): {prefix_best_path}")
     print(f"  Pure student wrapper   : {pure_student_wrapper_path}")
