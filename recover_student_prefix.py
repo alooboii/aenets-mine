@@ -17,6 +17,7 @@ from recovery_utils import (
     build_discarded_student_prefix,
     build_retained_student_tail,
     copy_prefix_weights,
+    family_depth_prune_and_pack,
     freeze_module,
     resolve_student_boundary,
     topk_prune_and_pack,
@@ -54,6 +55,13 @@ def parse_args():
     p.add_argument("--recover-mse-weight", type=float, default=1.0)
     p.add_argument("--recover-kd-weight", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=4.0)
+    p.add_argument(
+        "--recover-init-method",
+        type=str,
+        choices=["global_topk", "family_depth_stage"],
+        default="global_topk",
+        help="Recovered prefix initialization policy.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--track-assembled-val-acc", action="store_true", default=False)
 
@@ -296,11 +304,22 @@ def main():
     freeze_module(trained_tail)
     unfreeze_module(recovered_prefix)
 
-    prune_stats = topk_prune_and_pack(
-        source_modules=[("teacher_prefix", teacher_prefix), ("sae_encoder", sae_encoder)],
-        target_module=recovered_prefix,
-        device=device,
-    )
+    if args.recover_init_method == "global_topk":
+        prune_stats = topk_prune_and_pack(
+            source_modules=[("teacher_prefix", teacher_prefix), ("sae_encoder", sae_encoder)],
+            target_module=recovered_prefix,
+            device=device,
+        )
+    elif args.recover_init_method == "family_depth_stage":
+        prune_stats = family_depth_prune_and_pack(
+            source_modules=[("teacher_prefix", teacher_prefix), ("sae_encoder", sae_encoder)],
+            target_module=recovered_prefix,
+            device=device,
+        )
+    else:
+        raise ValueError(f"Unknown --recover-init-method: {args.recover_init_method}")
+
+    print(f"Recovery init method      : {args.recover_init_method}")
 
     optimizer = optim.Adam(recovered_prefix.parameters(), lr=args.recover_lr)
 
@@ -441,6 +460,7 @@ def main():
         "recover_mse_weight": args.recover_mse_weight,
         "recover_kd_weight": args.recover_kd_weight,
         "temperature": args.temperature,
+        "recover_init_method": args.recover_init_method,
         "hybrid_val_acc": hybrid_val_acc,
         "pure_student_val_acc": pure_student_val_acc,
         "site_check": {
