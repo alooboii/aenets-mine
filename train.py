@@ -58,6 +58,7 @@ python train.py --method sae_weightcompress \
 import os
 import sys
 import csv
+import json
 import time
 import argparse
 
@@ -71,6 +72,12 @@ from data import get_dataloaders
 from utils import set_seed
 from recovery_utils import validate_recovery_site
 from boomerang_utils import infer_model_family
+from performance_utils import (
+    benchmark_latency,
+    count_parameters as count_all_parameters,
+    estimate_model_flops,
+    evaluate_inference_runtime,
+)
 
 # ─── Per-method imports ──────────────────────────────────────────────────────
 from logits_kd import LogitKD
@@ -133,6 +140,12 @@ def parse_args():
     p.add_argument('--experiment-name', type=str, default=None,
                    help='Base name for log file and saved weights. '
                         'Defaults to --method if not set.')
+    p.add_argument('--disable-performance-profile', action='store_true', default=False,
+                   help='Disable end-of-run FLOPs/latency/runtime profiling.')
+    p.add_argument('--profile-latency-warmup', type=int, default=10,
+                   help='Warmup iterations for latency benchmarking.')
+    p.add_argument('--profile-latency-iters', type=int, default=30,
+                   help='Timed iterations for latency benchmarking.')
 
     # ── DKD-specific ──────────────────────────────────────────────────────────
     p.add_argument('--dkd-alpha', type=float, default=1.0,
@@ -253,6 +266,29 @@ def resolve_model_family(args) -> str:
     return 'cnn'
 
 
+class _SAEHybridLogitsWrapper(nn.Module):
+    def __init__(self, hybrid_model: nn.Module):
+        super().__init__()
+        self.hybrid_model = hybrid_model
+
+    def forward(self, x):
+        logits, _ = self.hybrid_model(x)
+        return logits
+
+
+def get_deploy_model_for_profiling(args, kd_model):
+    """
+    Return the model used at inference for method-level performance comparisons.
+    """
+    if args.method == 'sae_injection':
+        return _SAEHybridLogitsWrapper(kd_model.hybrid_model), 'aenets_hybrid'
+    if args.method == 'boomerang_kd':
+        return kd_model.student, 'boomerang_student'
+    if hasattr(kd_model, 'student'):
+        return kd_model.student, 'student'
+    return kd_model, 'kd_model'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Print experimental setup
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,6 +317,7 @@ def print_setup(args, device, num_classes, teacher, student, kd_model):
     print(f"  Batch size        : {args.batch_size}")
     print(f"  Learning rate     : {args.lr}")
     print(f"  Temperature       : {args.temperature}")
+    print(f"  Profiling         : {'off' if args.disable_performance_profile else 'on'}")
     if args.method == 'boomerang_kd':
         print(
             f"  Loss weights      : CLS={args.cls_weight}  "
@@ -813,8 +850,12 @@ def main():
         'epoch',
         'train_loss', 'train_cls_loss', 'train_kd_loss', 'train_aux_loss', 'train_acc',
         'val_loss',   'val_cls_loss',   'val_kd_loss',   'val_aux_loss',   'val_acc',
-        'lr', 'epoch_time_s',
+        'lr', 'train_time_s', 'eval_time_s', 'epoch_time_s',
     ]
+
+    epoch_train_times = []
+    epoch_eval_times = []
+    epoch_total_times = []
 
     with open(csv_path, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -824,15 +865,22 @@ def main():
             t0 = time.perf_counter()
 
             # Train
+            train_t0 = time.perf_counter()
             tr_loss, tr_cls, tr_kd, tr_aux, tr_acc = train_one_epoch(
                 kd_model, optimizer, train_loader, device, args, epoch)
+            train_elapsed = time.perf_counter() - train_t0
 
             # Eval
+            eval_t0 = time.perf_counter()
             vl_loss, vl_cls, vl_kd, vl_aux, vl_acc = eval_one_epoch(
                 kd_model, eval_loader, device, args, epoch)
+            eval_elapsed = time.perf_counter() - eval_t0
 
             elapsed = time.perf_counter() - t0
             lr_now  = optimizer.param_groups[0]['lr']
+            epoch_train_times.append(train_elapsed)
+            epoch_eval_times.append(eval_elapsed)
+            epoch_total_times.append(elapsed)
 
             # ── Terminal summary ───────────────────────────────────────────
             W = 80
@@ -860,13 +908,111 @@ def main():
                 epoch,
                 tr_loss, tr_cls, tr_kd, tr_aux, tr_acc,
                 vl_loss, vl_cls, vl_kd, vl_aux, vl_acc,
-                lr_now, elapsed,
+                lr_now, train_elapsed, eval_elapsed, elapsed,
             ])
             f.flush()
 
     # ── Save final weights ────────────────────────────────────────────────────
     final_path = os.path.join(args.model_dir, f'{args.experiment_name}_final.pth')
     torch.save(kd_model.state_dict(), final_path)
+
+    total_train_time_s = float(sum(epoch_train_times))
+    total_eval_time_s = float(sum(epoch_eval_times))
+    total_epoch_time_s = float(sum(epoch_total_times))
+    mean_train_time_s = total_train_time_s / max(len(epoch_train_times), 1)
+    mean_eval_time_s = total_eval_time_s / max(len(epoch_eval_times), 1)
+    mean_epoch_time_s = total_epoch_time_s / max(len(epoch_total_times), 1)
+
+    deploy_profile = {
+        "enabled": not args.disable_performance_profile,
+    }
+    if not args.disable_performance_profile:
+        try:
+            deploy_model, deploy_model_type = get_deploy_model_for_profiling(args, kd_model)
+            deploy_model = deploy_model.to(device).eval()
+
+            sample_data = next(iter(eval_loader))[0]
+            if sample_data.ndim != 4:
+                raise ValueError(
+                    f"Expected image batch tensor [B,C,H,W], got shape {tuple(sample_data.shape)}."
+                )
+            c = int(sample_data.shape[1])
+            h = int(sample_data.shape[2])
+            w = int(sample_data.shape[3])
+            input_shape = (1, c, h, w)
+
+            deploy_params = int(count_all_parameters(deploy_model, trainable_only=False))
+            deploy_flops = int(
+                estimate_model_flops(
+                    deploy_model,
+                    input_shape=input_shape,
+                    device=device,
+                )
+            )
+            latency_stats = benchmark_latency(
+                deploy_model,
+                input_shape=input_shape,
+                device=device,
+                warmup=args.profile_latency_warmup,
+                iters=args.profile_latency_iters,
+            )
+            runtime_stats = evaluate_inference_runtime(
+                deploy_model,
+                eval_loader,
+                device=device,
+            )
+
+            deploy_profile.update(
+                {
+                    "model_type": deploy_model_type,
+                    "input_shape": list(input_shape),
+                    "params": deploy_params,
+                    "flops": deploy_flops,
+                    "gflops": float(deploy_flops / 1e9),
+                    "latency_ms_per_batch1": latency_stats["latency_ms_per_batch"],
+                    "latency_throughput_samples_per_s_batch1": latency_stats["throughput_samples_per_s"],
+                    "inference_eval_time_s": runtime_stats["eval_time_s"],
+                    "inference_eval_acc": runtime_stats["eval_acc"],
+                    "inference_eval_throughput_samples_per_s": runtime_stats["throughput_samples_per_s"],
+                    "inference_eval_latency_ms_per_batch": runtime_stats["latency_ms_per_batch"],
+                    "inference_eval_latency_ms_per_sample": runtime_stats["latency_ms_per_sample"],
+                    "inference_eval_num_samples": runtime_stats["num_samples"],
+                    "inference_eval_num_batches": runtime_stats["num_batches"],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            deploy_profile["error"] = str(exc)
+
+    summary_path = os.path.join(args.save_dir, f'{args.experiment_name}_summary.json')
+    summary = {
+        "experiment_name": args.experiment_name,
+        "method": args.method,
+        "dataset": args.dataset,
+        "model_family": args.model_family,
+        "teacher_model": args.teacher_model,
+        "student_model": args.student_model,
+        "student_num_layers": args.student_num_layers,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "temperature": args.temperature,
+        "best_val_acc": best_acc,
+        "best_epoch": best_epoch,
+        "best_weights": best_model_path,
+        "final_weights": final_path,
+        "training_csv": csv_path,
+        "timing": {
+            "total_train_time_s": total_train_time_s,
+            "total_eval_time_s": total_eval_time_s,
+            "total_epoch_time_s": total_epoch_time_s,
+            "mean_train_time_s": mean_train_time_s,
+            "mean_eval_time_s": mean_eval_time_s,
+            "mean_epoch_time_s": mean_epoch_time_s,
+        },
+        "deployment_profile": deploy_profile,
+    }
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
 
     W = 80
     print(f"\n{'═'*W}")
@@ -876,6 +1022,18 @@ def main():
     print(f"  Best weights      : {best_model_path}")
     print(f"  Final weights     : {final_path}")
     print(f"  Training log      : {csv_path}")
+    print(f"  Summary JSON      : {summary_path}")
+    print(f"  Train time total  : {total_train_time_s:.1f}s")
+    print(f"  Eval time total   : {total_eval_time_s:.1f}s")
+    if not args.disable_performance_profile:
+        if 'error' in deploy_profile:
+            print(f"  Deploy profile    : failed ({deploy_profile['error']})")
+        else:
+            print(
+                f"  Deploy profile    : {deploy_profile['model_type']} | "
+                f"GFLOPs={deploy_profile['gflops']:.3f} | "
+                f"latency@bs1={deploy_profile['latency_ms_per_batch1']:.3f}ms"
+            )
     print(f"{'═'*W}\n")
 
 
