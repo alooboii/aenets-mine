@@ -353,7 +353,8 @@ class SAEInjection(nn.Module):
             # Early shape check for ViT boundary compatibility.
             try:
                 with torch.no_grad():
-                    probe = torch.randn(1, 3, 224, 224)
+                    probe_device = next(teacher_trunk.parameters()).device
+                    probe = torch.randn(1, 3, 224, 224, device=probe_device)
                     teacher_tokens = teacher_trunk(probe)
                     _recon, latent_tokens, _loss = sae_adapter(teacher_tokens)
                     _ = student_trunk(latent_tokens)
