@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import time
 from typing import List
 
 import torch
@@ -48,6 +49,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-dir", type=str, default="logs")
     p.add_argument("--experiment-name", type=str, default="boomerang_interpolation")
+    p.add_argument("--log-every-batches", type=int, default=20)
+    p.add_argument("--quiet", action="store_true", default=False)
 
     return p.parse_args()
 
@@ -63,17 +66,47 @@ def resolve_model_family(args) -> str:
 
 
 @torch.no_grad()
-def eval_accuracy(model: torch.nn.Module, dataloader, device: torch.device) -> float:
+def eval_accuracy(
+    model: torch.nn.Module,
+    dataloader,
+    device: torch.device,
+    *,
+    label: str = "eval",
+    log_every_batches: int = 20,
+    quiet: bool = False,
+) -> float:
     model.eval()
     total = 0
     correct = 0
-    for data, target in dataloader:
+    num_batches = len(dataloader)
+    t0 = time.perf_counter()
+
+    if not quiet:
+        print(f"[{label}] start | batches={num_batches} | device={device}")
+
+    for batch_idx, (data, target) in enumerate(dataloader, start=1):
         data = data.to(device)
         target = target.to(device)
         logits = model(data)
         pred = logits.argmax(dim=1)
         total += target.size(0)
         correct += (pred == target).sum().item()
+
+        if not quiet and (
+            batch_idx % max(log_every_batches, 1) == 0 or batch_idx == num_batches
+        ):
+            running_acc = 100.0 * correct / max(total, 1)
+            elapsed = time.perf_counter() - t0
+            print(
+                f"[{label}] batch {batch_idx}/{num_batches} | "
+                f"running_acc={running_acc:.2f}% | elapsed={elapsed:.1f}s"
+            )
+
+    if not quiet:
+        final_acc = 100.0 * correct / max(total, 1)
+        elapsed = time.perf_counter() - t0
+        print(f"[{label}] done | acc={final_acc:.2f}% | elapsed={elapsed:.1f}s")
+
     return correct / max(total, 1)
 
 
@@ -85,6 +118,8 @@ def main():
         raise ValueError("Boomerang interpolation eval currently supports ViT only.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not args.quiet:
+        print(f"[Setup] device={device} | model_family={args.model_family}")
 
     _, eval_loader, num_classes = get_dataloaders(
         dataset=args.dataset,
@@ -122,13 +157,24 @@ def main():
     except TypeError:
         checkpoint = torch.load(args.boomerang_checkpoint, map_location=device)
     kd_model.load_state_dict(checkpoint, strict=True)
+    if not args.quiet:
+        print(f"[Setup] loaded checkpoint: {args.boomerang_checkpoint}")
 
     layer_map = kd_model.get_layer_map()
     M = layer_map.student_num_layers
+    if not args.quiet:
+        print(f"[Setup] sweep student depth M={M}")
 
     rows: List[dict] = []
 
-    student_acc = eval_accuracy(kd_model.student, eval_loader, device)
+    student_acc = eval_accuracy(
+        kd_model.student,
+        eval_loader,
+        device,
+        label="student",
+        log_every_batches=args.log_every_batches,
+        quiet=args.quiet,
+    )
     rows.append(
         {
             "model_type": "student",
@@ -139,11 +185,22 @@ def main():
     )
 
     for K in range(1, M + 1):
+        if not args.quiet:
+            print(f"[intermediate K={K}] building model...")
         intermediate = kd_model.build_intermediate(
             num_layers_to_patch=K,
             patch_order=args.boomerang_patch_order,
         ).to(device)
-        inter_acc = eval_accuracy(intermediate, eval_loader, device)
+        inter_acc = eval_accuracy(
+            intermediate,
+            eval_loader,
+            device,
+            label=f"intermediate K={K}",
+            log_every_batches=args.log_every_batches,
+            quiet=args.quiet,
+        )
+        if not args.quiet:
+            print(f"[intermediate K={K}] acc={inter_acc*100:.2f}%")
         rows.append(
             {
                 "model_type": "intermediate",
@@ -153,7 +210,14 @@ def main():
             }
         )
 
-    teacher_acc = eval_accuracy(kd_model.teacher, eval_loader, device)
+    teacher_acc = eval_accuracy(
+        kd_model.teacher,
+        eval_loader,
+        device,
+        label="teacher",
+        log_every_batches=args.log_every_batches,
+        quiet=args.quiet,
+    )
     rows.append(
         {
             "model_type": "teacher",
