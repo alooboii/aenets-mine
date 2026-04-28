@@ -9,6 +9,7 @@ import argparse
 
 from models import TeacherModel
 from data import get_dataloaders
+from utils import set_seed
 
 
 def train_one_epoch(model, optimizer, dataloader, criterion, device, epoch, total_epochs):
@@ -90,7 +91,6 @@ def eval_one_epoch(model, dataloader, criterion, device, epoch, total_epochs):
 
 
 def main():
-    torch.manual_seed(42)
     parser = argparse.ArgumentParser(description="Fine-tune Teacher Model")
     
     # Model and dataset arguments
@@ -102,6 +102,11 @@ def main():
                         help='Dataset to use (CIFAR10, CIFAR100, IMAGENETTE, FOOD101, CUSTOM)')
     parser.add_argument('--data-root', type=str, default='./data', 
                         help='Root directory for dataset')
+    parser.add_argument('--model-family', type=str, default='auto',
+                        choices=['auto', 'cnn', 'vit'],
+                        help='Backbone family. auto infers from model name.')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed.')
     
     # Training hyperparameters
     parser.add_argument('--epochs', type=int, default=100, 
@@ -136,6 +141,10 @@ def main():
                         help='Name for this experiment (used in filenames)')
     
     args = parser.parse_args()
+    set_seed(args.seed)
+
+    if args.model_family == 'auto':
+        args.model_family = 'vit' if args.model.lower().startswith('vit') else 'cnn'
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -144,9 +153,11 @@ def main():
     print(f"{'='*80}", flush=True)
     print(f"Device: {device}", flush=True)
     print(f"Model: {args.model} ({'ImageNet pretrained' if args.pretrained else 'random init'})", flush=True)
+    print(f"Model family: {args.model_family}", flush=True)
     print(f"Dataset: {args.dataset}", flush=True)
     print(f"Batch Size: {args.batch_size} | Epochs: {args.epochs}", flush=True)
     print(f"Learning Rate: {args.lr}", flush=True)
+    print(f"Seed: {args.seed}", flush=True)
     if args.use_scheduler:
         print(f"LR Scheduler: StepLR (step_size={args.step_size}, gamma={args.lr_decay})", flush=True)
     print(f"Augmentations - Jitter: {args.jitter}, Edge: {args.edge}, Noise: {args.noise}", flush=True)
@@ -159,7 +170,8 @@ def main():
         root=args.data_root,
         jitter=args.jitter,
         edge=args.edge,
-        noise=args.noise
+        noise=args.noise,
+        model_family=args.model_family,
     )
     
     print(f"Dataset loaded: {len(train_loader.dataset)} train samples, "
@@ -170,7 +182,8 @@ def main():
         model_name=args.model,
         num_classes=num_classes,
         weights_path=None,
-        pretrained=args.pretrained
+        pretrained=args.pretrained,
+        model_family=args.model_family,
     ).to(device)
     
     # Count parameters

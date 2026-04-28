@@ -56,7 +56,8 @@ def _format_train_cmd(args, teacher_layer: str, teacher_channels: int, student_l
     return (
         f"python train.py --method sae_injection "
         f"--teacher-model {args.teacher_model} --student-model {args.student_model} "
-        f"--dataset {args.dataset} --batch-size {args.batch_size} --epochs {args.default_epochs} "
+        f"--dataset {args.dataset} --data-root {args.data_root} "
+        f"--batch-size {args.batch_size} --epochs {args.default_epochs} "
         f"--teacher-layer {teacher_layer} --teacher-channels {teacher_channels} "
         f"--student-layers {student_layers_joined} --student-channels {student_channels} "
         f"--sparsity {args.sparsity} --recovery-site-check "
@@ -70,7 +71,7 @@ def _format_recover_cmd(args, teacher_layer: str, teacher_channels: int, student
         f"python recover_student_prefix.py "
         f"--aenets-checkpoint weights/{run_name}_best.pth "
         f"--teacher-model {args.teacher_model} --student-model {args.student_model} "
-        f"--dataset {args.dataset} --batch-size {args.batch_size} "
+        f"--dataset {args.dataset} --data-root {args.data_root} --batch-size {args.batch_size} "
         f"--teacher-layer {teacher_layer} --teacher-channels {teacher_channels} "
         f"--student-layers {student_layers_joined} --student-channels {student_channels} "
         f"--sparsity {args.sparsity} "

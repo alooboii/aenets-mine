@@ -1,7 +1,7 @@
 """
 train.py — Unified Knowledge Distillation Training Script
 ==========================================================
-Supports six distillation schemes selected via --method:
+Supports distillation schemes selected via --method:
 
   logit_kd          Classical KD (Hinton et al.)         logits_kd.py
   dkd               Decoupled KD (Zhao et al., 2022)     dkd.py
@@ -9,6 +9,7 @@ Supports six distillation schemes selected via --method:
   crd               Contrastive Repr. Distil.             crd.py
   sae_injection     SAE feature injection                 sae_injection.py
   sae_weightcompress SAE + weight compression             sae_weightcompress.py
+  boomerang_kd      Boomerang distillation (ViT)          boomerang_kd.py
 
 Usage examples
 --------------
@@ -69,6 +70,7 @@ from models import TeacherModel, StudentModel
 from data import get_dataloaders
 from utils import set_seed
 from recovery_utils import validate_recovery_site
+from boomerang_utils import infer_model_family
 
 # ─── Per-method imports ──────────────────────────────────────────────────────
 from logits_kd import LogitKD
@@ -77,6 +79,7 @@ from fitnet import FitNet
 from crd import CRD, CRDDataset
 from sae_injection import SAEInjection
 from sae_weightcompress import SAEWeightCompressor
+from boomerang_kd import BoomerangKD
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Argument parsing
@@ -91,7 +94,7 @@ def parse_args():
     # ── Core training ─────────────────────────────────────────────────────────
     p.add_argument('--method', type=str, required=True,
                    choices=['logit_kd', 'dkd', 'fitnet', 'crd',
-                            'sae_injection', 'sae_weightcompress'],
+                            'sae_injection', 'sae_weightcompress', 'boomerang_kd'],
                    help='Distillation method to use.')
     p.add_argument('--dataset', type=str, default='CIFAR100',
                    help='Dataset name (CIFAR10, CIFAR100, IMAGENETTE, FOOD101, CUSTOM).')
@@ -99,10 +102,17 @@ def parse_args():
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--data-root', type=str, default='./data',
+                   help='Dataset root directory used by data.get_dataloaders().')
 
     # ── Models ────────────────────────────────────────────────────────────────
     p.add_argument('--teacher-model', type=str, default='resnet50')
     p.add_argument('--student-model', type=str, default='resnet18')
+    p.add_argument('--model-family', type=str, default='auto',
+                   choices=['auto', 'cnn', 'vit'],
+                   help='Backbone family. auto infers from model names.')
+    p.add_argument('--student-num-layers', type=int, default=None,
+                   help='Optional student depth truncation (ViT).')
     p.add_argument('--teacher-weights', type=str, default=None,
                    help='Path to pretrained teacher weights (.pth).')
     p.add_argument('--student-weights', type=str, default=None,
@@ -167,6 +177,13 @@ def parse_args():
     # ── SAEInjection-specific ─────────────────────────────────────────────────
     p.add_argument('--teacher-layer', type=str, default=None,
                    help='[SAEInjection] Teacher hint layer name.')
+    p.add_argument('--aenets-teacher-boundary', type=int, default=None,
+                   help='[SAEInjection ViT] Teacher prefix boundary in encoder blocks.')
+    p.add_argument('--aenets-student-boundary', type=int, default=None,
+                   help='[SAEInjection ViT] Student tail start boundary in encoder blocks.')
+    p.add_argument('--sae-adapter-type', type=str, default='auto',
+                   choices=['auto', 'conv2d', 'token_linear'],
+                   help='[SAEInjection] SAE adapter type. auto picks by model family.')
     p.add_argument('--teacher-channels', type=int, default=None,
                    help='[SAEInjection] Channel count at teacher hint layer.')
     p.add_argument('--student-channels', type=int, default=None,
@@ -175,6 +192,20 @@ def parse_args():
                    help='[SAEInjection] Freeze the teacher trunk parameters.')
     p.add_argument('--recovery-site-check', action='store_true', default=False,
                    help='[SAEInjection] Validate that this split can be recovered to a pure student.')
+
+    # ── Boomerang KD-specific ────────────────────────────────────────────────
+    p.add_argument('--boomerang-keep-every', type=int, default=2,
+                   help='[Boomerang] Keep every Nth teacher layer when initializing student.')
+    p.add_argument('--boomerang-keep-last-layer', type=lambda x: str(x).lower() in {'1', 'true', 'yes', 'y'},
+                   nargs='?', const=True, default=True,
+                   help='[Boomerang] Force keep the final teacher layer in the kept index set.')
+    p.add_argument('--boomerang-kd-weight', type=float, default=0.1,
+                   help='[Boomerang] KL loss weight.')
+    p.add_argument('--boomerang-cos-weight', type=float, default=None,
+                   help='[Boomerang] Cosine feature loss weight. Default: 2/(M+1).')
+    p.add_argument('--boomerang-patch-order', type=str, default='reverse',
+                   choices=['reverse', 'forward'],
+                   help='[Boomerang] Zero-shot interpolation patch order.')
 
     # ── SAEWeightCompressor-specific ──────────────────────────────────────────
     p.add_argument('--swc-teacher-layers', nargs='+', type=str, default=None,
@@ -212,6 +243,16 @@ def parse_layer_specs(specs):
     return names, channels
 
 
+def resolve_model_family(args) -> str:
+    if args.model_family != 'auto':
+        return args.model_family
+    t_family = infer_model_family(args.teacher_model)
+    s_family = infer_model_family(args.student_model)
+    if 'vit' in {t_family, s_family}:
+        return 'vit'
+    return 'cnn'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Print experimental setup
 # ══════════════════════════════════════════════════════════════════════════════
@@ -224,6 +265,7 @@ def print_setup(args, device, num_classes, teacher, student, kd_model):
 
     print(f"  Method            : {args.method.upper()}")
     print(f"  Dataset           : {args.dataset}  ({num_classes} classes)")
+    print(f"  Model family      : {args.model_family}")
     print(f"  Device            : {device}")
     print(f"  Seed              : {args.seed}")
     print()
@@ -231,6 +273,7 @@ def print_setup(args, device, num_classes, teacher, student, kd_model):
     if args.teacher_weights:
         print(f"  Teacher weights   : {args.teacher_weights}")
     print(f"  Student model     : {args.student_model}")
+    print(f"  Student layers    : {args.student_num_layers if args.student_num_layers is not None else 'full'}")
     if args.student_weights:
         print(f"  Student weights   : {args.student_weights}")
     print()
@@ -238,7 +281,14 @@ def print_setup(args, device, num_classes, teacher, student, kd_model):
     print(f"  Batch size        : {args.batch_size}")
     print(f"  Learning rate     : {args.lr}")
     print(f"  Temperature       : {args.temperature}")
-    print(f"  Loss weights      : CLS={args.cls_weight}  KD={args.kd_weight}  SAE={args.sae_weight}")
+    if args.method == 'boomerang_kd':
+        print(
+            f"  Loss weights      : CLS={args.cls_weight}  "
+            f"Boomerang-KL={args.boomerang_kd_weight}  "
+            f"Boomerang-COS={args.boomerang_cos_weight}"
+        )
+    else:
+        print(f"  Loss weights      : CLS={args.cls_weight}  KD={args.kd_weight}  SAE={args.sae_weight}")
 
     # Method-specific details
     print()
@@ -264,10 +314,20 @@ def print_setup(args, device, num_classes, teacher, student, kd_model):
     elif args.method == 'sae_injection':
         print(f"  Teacher hint layer: {args.teacher_layer} ({args.teacher_channels}ch)")
         print(f"  Student trunk     : {args.student_layers}")
+        print(f"  Teacher boundary  : {args.aenets_teacher_boundary}")
+        print(f"  Student boundary  : {args.aenets_student_boundary}")
+        print(f"  SAE adapter type  : {args.sae_adapter_type}")
         print(f"  SAE input channels: {args.student_channels}")
         print(f"  Freeze teacher    : {args.freeze_teacher}")
         print(f"  Recovery site chk : {args.recovery_site_check}")
         print(f"  Sparsity          : {args.sparsity}")
+
+    elif args.method == 'boomerang_kd':
+        print(f"  Keep every        : {args.boomerang_keep_every}")
+        print(f"  Keep last layer   : {args.boomerang_keep_last_layer}")
+        print(f"  KL weight         : {args.boomerang_kd_weight}")
+        print(f"  Cosine weight     : {args.boomerang_cos_weight}")
+        print(f"  Patch order       : {args.boomerang_patch_order}")
 
     elif args.method == 'sae_weightcompress':
         print(f"  Teacher layers    : {args.swc_teacher_layers}")
@@ -340,10 +400,15 @@ def build_kd_model(args, teacher, student, num_train_samples, device):
         ).to(device)
 
     elif method == 'sae_injection':
-        for attr in ['teacher_layer', 'teacher_channels',
-                     'student_layers', 'student_channels']:
-            if getattr(args, attr) is None:
-                raise ValueError(f"--{attr.replace('_', '-')} is required for SAEInjection.")
+        if args.model_family == 'vit':
+            # ViT path uses boundary-based split; channels default to hidden dims if omitted.
+            if args.aenets_student_boundary is None:
+                print("[SAEInjection ViT] --aenets-student-boundary not set; using default midpoint.")
+        else:
+            for attr in ['teacher_layer', 'teacher_channels',
+                         'student_layers', 'student_channels']:
+                if getattr(args, attr) is None:
+                    raise ValueError(f"--{attr.replace('_', '-')} is required for SAEInjection.")
         return SAEInjection(
             teacher=teacher,
             student=student,
@@ -353,6 +418,23 @@ def build_kd_model(args, teacher, student, num_train_samples, device):
             student_channels=args.student_channels,
             sparsity=args.sparsity,
             freeze_teacher=args.freeze_teacher,
+            teacher_boundary=args.aenets_teacher_boundary,
+            student_boundary=args.aenets_student_boundary,
+            sae_adapter_type=args.sae_adapter_type,
+            model_family=args.model_family,
+        ).to(device)
+
+    elif method == 'boomerang_kd':
+        if args.model_family != 'vit':
+            raise ValueError("--method boomerang_kd requires ViT backbones (--model-family vit).")
+        if args.student_num_layers is None:
+            raise ValueError("--student-num-layers is required for --method boomerang_kd.")
+        return BoomerangKD(
+            teacher=teacher,
+            student=student,
+            keep_every=args.boomerang_keep_every,
+            keep_last_layer=args.boomerang_keep_last_layer,
+            student_num_layers=args.student_num_layers,
         ).to(device)
 
     elif method == 'sae_weightcompress':
@@ -412,7 +494,7 @@ def forward_kd(method, kd_model, data, target, device):
         return t_logits, s_logits, combined
 
     else:
-        # logit_kd, crd, sae_weightcompress all return (t_logits, s_logits, aux)
+        # logit_kd, crd, sae_weightcompress, boomerang_kd return (t_logits, s_logits, aux)
         return kd_model(data)
 
 
@@ -480,6 +562,13 @@ def compute_loss(method, teacher_logits, student_logits, target,
         total = (args.cls_weight * cls_loss
                  + args.kd_weight  * kl_loss
                  + args.sae_weight * aux)
+        return total, cls_loss_val, kl_loss.item(), aux.item()
+
+    elif method == 'boomerang_kd':
+        # aux_loss = cosine alignment term; KL is explicit and weighted separately.
+        total = (args.cls_weight * cls_loss
+                 + args.boomerang_kd_weight * kl_loss
+                 + args.boomerang_cos_weight * aux)
         return total, cls_loss_val, kl_loss.item(), aux.item()
 
     else:
@@ -605,12 +694,15 @@ def main():
     if args.experiment_name is None:
         args.experiment_name = args.method
 
+    args.model_family = resolve_model_family(args)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, eval_loader, num_classes = get_dataloaders(
         dataset=args.dataset,
         batch_size=args.batch_size,
+        root=args.data_root,
+        model_family=args.model_family,
     )
 
     # CRD needs sample-index tracking — wrap the underlying dataset
@@ -633,13 +725,16 @@ def main():
         model_name=args.teacher_model,
         num_classes=num_classes,
         weights_path=args.teacher_weights,
-        pretrained=True,
+        pretrained=(args.teacher_weights is None),
+        model_family=args.model_family,
     ).to(device)
 
     student = StudentModel(
         model_name=args.student_model,
         num_classes=num_classes,
         weights_path=args.student_weights,
+        model_family=args.model_family,
+        num_layers=args.student_num_layers,
     ).to(device)
 
     # Freeze teacher globally (each KD wrapper may handle this internally too)
@@ -648,7 +743,12 @@ def main():
     teacher.eval()
 
     # ── KD Model ──────────────────────────────────────────────────────────────
+    if args.method == 'boomerang_kd' and args.model_family != 'vit':
+        raise ValueError("Boomerang KD currently supports ViT only. Use --model-family vit.")
+
     if args.method == 'sae_injection' and args.recovery_site_check:
+        if args.model_family != 'cnn':
+            raise ValueError("--recovery-site-check currently supports only ResNet/CNN stage-level sites.")
         site_check = validate_recovery_site(
             teacher_model=teacher.model,
             student_model=student.model,
@@ -679,6 +779,14 @@ def main():
             )
 
     kd_model = build_kd_model(args, teacher, student, num_train, device)
+
+    if args.method == 'boomerang_kd' and args.boomerang_cos_weight is None:
+        student_depth = kd_model.get_layer_map().student_num_layers
+        args.boomerang_cos_weight = 2.0 / (student_depth + 1)
+        print(
+            f"[Boomerang] Auto cosine weight set to 2/(M+1) = "
+            f"{args.boomerang_cos_weight:.6f} (M={student_depth})"
+        )
 
     # ── Print setup ───────────────────────────────────────────────────────────
     print_setup(args, device, num_classes, teacher, student, kd_model)

@@ -304,6 +304,22 @@ def main():
     freeze_module(trained_tail)
     unfreeze_module(recovered_prefix)
 
+    frozen_groups = {
+        "teacher": kd_model.teacher,
+        "teacher_prefix": teacher_prefix,
+        "sae_encoder": sae_encoder,
+        "trained_tail": trained_tail,
+    }
+    for group_name, module in frozen_groups.items():
+        leaked = [n for n, p in module.named_parameters() if p.requires_grad]
+        if leaked:
+            raise RuntimeError(
+                f"Freeze invariant violated: {group_name} has trainable params (e.g. {leaked[:3]})."
+            )
+    recovered_trainable = [n for n, p in recovered_prefix.named_parameters() if p.requires_grad]
+    if not recovered_trainable:
+        raise RuntimeError("Recovered prefix has no trainable parameters.")
+
     if args.recover_init_method == "global_topk":
         prune_stats = topk_prune_and_pack(
             source_modules=[("teacher_prefix", teacher_prefix), ("sae_encoder", sae_encoder)],

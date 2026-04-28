@@ -12,13 +12,16 @@ from PIL import Image, ImageFilter, ImageDraw
 
 
 # Imagenette download logic (without fastai)
-def download_imagenette(dest_tgz="imagenette2-160.tgz", extract_dir="imagenette"):
+def download_imagenette(root="./data", dest_tgz="imagenette2-160.tgz", extract_dir="imagenette"):
+    os.makedirs(root, exist_ok=True)
+    tgz_path = os.path.join(root, dest_tgz)
+    extract_path = os.path.join(root, extract_dir)
     url = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
-    if not os.path.exists(dest_tgz):
+    if not os.path.exists(tgz_path):
         response = requests.get(url, stream=True)
         total = int(response.headers.get('content-length', 0))
-        with open(dest_tgz, 'wb') as file, tqdm(
-            desc=dest_tgz,
+        with open(tgz_path, 'wb') as file, tqdm(
+            desc=tgz_path,
             total=total,
             unit='iB',
             unit_scale=True,
@@ -27,10 +30,13 @@ def download_imagenette(dest_tgz="imagenette2-160.tgz", extract_dir="imagenette"
             for data in response.iter_content(chunk_size=1024):
                 size = file.write(data)
                 bar.update(size)
-    if not os.path.exists(extract_dir):
-        with tarfile.open(dest_tgz, "r:gz") as tar:
-            tar.extractall(extract_dir)
-    return os.path.join(extract_dir, "imagenette2-160", "train"), os.path.join(extract_dir, "imagenette2-160", "val")
+    if not os.path.exists(extract_path):
+        with tarfile.open(tgz_path, "r:gz") as tar:
+            tar.extractall(extract_path)
+    return (
+        os.path.join(extract_path, "imagenette2-160", "train"),
+        os.path.join(extract_path, "imagenette2-160", "val"),
+    )
 
 # Transform classes
 class JitterTransform:
@@ -73,22 +79,51 @@ class SpuriousDataset(Dataset):
         return img, label
 
 # Compose standard transforms
-def get_transforms(edge=False, jitter=False, noise=False):
-    if edge:
-        pipeline = [transforms.Resize((224,224)), EdgeTransform(), transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))]
-    elif jitter:
-        pipeline = [transforms.Resize((224,224)), transforms.ColorJitter(0.4,0.4,0.4,0.2), transforms.ToTensor(), transforms.Normalize([0.5071,0.4867,0.4408],[0.2675,0.2565,0.2761])]
-    elif noise:
-        pipeline = [transforms.Resize((224,224)), AddNoiseTransform(), transforms.ToTensor(), transforms.Normalize([0.5071,0.4867,0.4408],[0.2675,0.2565,0.2761])]
+def get_transforms(edge=False, jitter=False, noise=False, model_family="cnn"):
+    use_imagenet_stats = model_family == "vit"
+    if use_imagenet_stats:
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        resize_ops = [transforms.Resize(256), transforms.CenterCrop(224)]
     else:
-        pipeline = [transforms.Resize((224,224)), transforms.ToTensor(), transforms.Normalize([0.5071,0.4867,0.4408],[0.2675,0.2565,0.2761])]
+        mean = [0.5071, 0.4867, 0.4408]
+        std = [0.2675, 0.2565, 0.2761]
+        resize_ops = [transforms.Resize((224, 224))]
+
+    if edge:
+        pipeline = [
+            *resize_ops,
+            EdgeTransform(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    elif jitter:
+        pipeline = [
+            *resize_ops,
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    elif noise:
+        pipeline = [
+            *resize_ops,
+            AddNoiseTransform(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+    else:
+        pipeline = [
+            *resize_ops,
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
     return transforms.Compose(pipeline)
 
 # Load dataset with optional spurious label cards
 def get_dataset(name="CIFAR100", root="./data", download=True,
-                jitter=False, edge=False, noise=False, set_spurious=False):
+                jitter=False, edge=False, noise=False, set_spurious=False, model_family="cnn"):
     name = name.upper()
-    transform = get_transforms(edge, jitter, noise)
+    transform = get_transforms(edge, jitter, noise, model_family=model_family)
 
     if name in ["CIFAR10", "CIFAR100"]:
         cls = torchvision.datasets.CIFAR10 if name == "CIFAR10" else torchvision.datasets.CIFAR100
@@ -102,7 +137,7 @@ def get_dataset(name="CIFAR100", root="./data", download=True,
         num_classes = len(train_raw.classes)
 
     elif name == "IMAGENETTE":
-        train_dir, val_dir = download_imagenette()
+        train_dir, val_dir = download_imagenette(root=root)
         train_raw = torchvision.datasets.ImageFolder(train_dir, transform=None)
         test_raw  = torchvision.datasets.ImageFolder(val_dir,   transform=None)
         if set_spurious:
@@ -141,9 +176,9 @@ def get_dataset(name="CIFAR100", root="./data", download=True,
 
 # DataLoader function
 def get_dataloaders(dataset="CIFAR100", batch_size=128, root="./data",
-                    jitter=False, edge=False, noise=False, set_spurious=False):
+                    jitter=False, edge=False, noise=False, set_spurious=False, model_family="cnn"):
     train_set, test_set, num_classes = get_dataset(dataset, root, True,
-                                                   jitter, edge, noise, set_spurious)
+                                                   jitter, edge, noise, set_spurious, model_family)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=4, pin_memory=True)
     test_loader  = DataLoader(test_set,  batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, num_classes
