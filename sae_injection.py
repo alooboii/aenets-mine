@@ -354,6 +354,8 @@ class SAEInjection(nn.Module):
             try:
                 with torch.no_grad():
                     probe_device = next(teacher_trunk.parameters()).device
+                    sae_adapter = sae_adapter.to(probe_device)
+                    student_trunk = student_trunk.to(probe_device)
                     probe = torch.randn(1, 3, 224, 224, device=probe_device)
                     teacher_tokens = teacher_trunk(probe)
                     _recon, latent_tokens, _loss = sae_adapter(teacher_tokens)
